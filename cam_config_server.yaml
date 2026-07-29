@@ -11,7 +11,7 @@ head_camera:
   # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
   zmq_port : 55555
   # Set to true to enable WebRTC publishing, false to disable
-  enable_webrtc: true
+  enable_webrtc: false
   # Port for WebRTC signaling server
   webrtc_port : 60001
   # webrtc codec preference, options: "vp8", "h264"

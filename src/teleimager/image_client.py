@@ -697,6 +697,25 @@ class ImageClient:
         if self._cam_config['head_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
 
+        head_config = self._cam_config["head_camera"]
+
+        if (head_config.get("enable_depth", False) and head_config.get("depth_zmq_port") is not None):
+            self._subscriber_manager.subscribe(
+                self._host,
+                head_config["depth_zmq_port"],
+                request_bgr=False,
+            )
+
+        if (
+            head_config.get("enable_depth", False)
+            and head_config.get("raw_depth_zmq_port") is not None
+        ):
+            self._subscriber_manager.subscribe(
+                self._host,
+                head_config["raw_depth_zmq_port"],
+                request_bgr=False,
+            )
+
         if self._cam_config['left_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
 
@@ -715,6 +734,92 @@ class ImageClient:
     def get_head_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
     
+    def get_head_depth_frame(self):
+        head_config = self._cam_config["head_camera"]
+
+        if not head_config.get("enable_depth", False):
+            return None
+
+        depth_port = head_config.get("depth_zmq_port")
+        if depth_port is None:
+            return None
+
+        depth_message = self._subscriber_manager.subscribe(
+            self._host,
+            depth_port,
+            request_bgr=False,
+        )
+
+        depth_bytes = depth_message.jpg
+        if depth_bytes is None:
+            return None
+
+        depth = cv2.imdecode(
+            np.frombuffer(depth_bytes, dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+
+        if depth is None:
+            logger_mp.warning("[Image Client] Failed to decode depth PNG.")
+            return None
+
+        if depth.dtype != np.uint16:
+            logger_mp.warning(
+                f"[Image Client] Unexpected depth dtype: {depth.dtype}"
+            )
+            return None
+
+        return depth
+
+    def get_head_raw_depth_frame(self):
+        head_config = self._cam_config["head_camera"]
+
+        if not head_config.get("enable_depth", False):
+            return None
+
+        raw_depth_port = head_config.get(
+            "raw_depth_zmq_port"
+        )
+
+        if raw_depth_port is None:
+            return None
+
+        raw_depth_message = (
+            self._subscriber_manager.subscribe(
+                self._host,
+                raw_depth_port,
+                request_bgr=False,
+            )
+        )
+
+        raw_depth_bytes = raw_depth_message.jpg
+
+        if raw_depth_bytes is None:
+            return None
+
+        raw_depth = cv2.imdecode(
+            np.frombuffer(
+                raw_depth_bytes,
+                dtype=np.uint8,
+            ),
+            cv2.IMREAD_UNCHANGED,
+        )
+
+        if raw_depth is None:
+            logger_mp.warning(
+                "[Image Client] Failed to decode raw depth PNG."
+            )
+            return None
+
+        if raw_depth.dtype != np.uint16:
+            logger_mp.warning(
+                f"[Image Client] Unexpected raw depth dtype: "
+                f"{raw_depth.dtype}"
+            )
+            return None
+
+        return raw_depth
+
     def get_left_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
     
