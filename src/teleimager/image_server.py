@@ -20,6 +20,10 @@ import glob
 import cv2
 import numpy as np
 # uvc will be imported when needed
+try:
+    import uvc
+except ImportError:
+    uvc = None
 import yaml
 import time
 import threading
@@ -900,12 +904,28 @@ class BaseCamera:
 
 class RealSenseCamera(BaseCamera):
     def __init__(self, cam_topic, serial_number, img_shape, fps, 
-                 enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False):
+                 enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False,
+                 depth_zmq_port=None, raw_depth_zmq_port=None,):
         rs = self.check_pyrealsense2_install()
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
         self._serial_number = serial_number
         self._enable_depth = enable_depth
         self._latest_depth = None
+        self._depth_zmq_port = depth_zmq_port
+        self._depth_zmq_buffer = (
+            TripleRingBuffer()
+            if self._enable_depth and self._depth_zmq_port is not None
+            else None
+        )
+        self._latest_raw_depth = None
+        self._raw_depth_zmq_port = raw_depth_zmq_port
+
+        self._raw_depth_zmq_buffer = (
+            TripleRingBuffer()
+            if self._enable_depth and raw_depth_zmq_port is not None
+            else None
+)
+
         try:
             align_to = rs.stream.color
             self.align = rs.align(align_to)
@@ -941,7 +961,8 @@ class RealSenseCamera(BaseCamera):
             f"[RealSenseCamera: {self._cam_topic}] initialized with "
             f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
             f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
-            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}"
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'} "
+            f"Depth: {'enabled, scale=' + str(self.g_depth_scale) + ', depth_zmq_port=' + str(self._depth_zmq_port) if self._enable_depth else 'disabled'}; "
         )
 
     def check_pyrealsense2_install(self):
@@ -957,17 +978,64 @@ class RealSenseCamera(BaseCamera):
         frames = self.pipeline.wait_for_frames()
         aligned_frames = self.align.process(frames)
         color_frame = aligned_frames.get_color_frame()
+
         if not color_frame:
             return None
 
         if self._enable_depth:   
+            raw_depth_frame = frames.get_depth_frame()
+
+            if raw_depth_frame:
+                self._latest_raw_depth = np.asanyarray(
+                    raw_depth_frame.get_data()
+                ).copy()
+
+                if self._raw_depth_zmq_buffer is not None:
+                    encoded, raw_depth_png = cv2.imencode(
+                        ".png",
+                        self._latest_raw_depth,
+                        [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                    )
+
+                    if encoded:
+                        self._raw_depth_zmq_buffer.write(
+                            raw_depth_png.tobytes()
+                        )
+                    else:
+                        logger_mp.warning(
+                            f"[RealSenseCamera: {self._cam_topic}] "
+                            "Failed to encode raw depth frame."
+                        )
+            else:
+                self._latest_raw_depth = None
+
             depth_frame = aligned_frames.get_depth_frame()
+
             if depth_frame:
-                self._latest_depth = np.asanyarray(depth_frame.get_data())
+                self._latest_depth = np.asanyarray(depth_frame.get_data()).copy()
+
+                if self._depth_zmq_buffer is not None:
+                    encoded, depth_png = cv2.imencode(
+                        ".png",
+                        self._latest_depth,
+                        [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                    )
+
+                    if encoded:
+                        self._depth_zmq_buffer.write(depth_png.tobytes())
+                    else:
+                        logger_mp.warning(
+                            f"[RealSenseCamera: {self._cam_topic}] "
+                            "Failed to encode depth frame."
+                        )
+
             else:
                 self._latest_depth = None
+        else:
+            self._latest_raw_depth = None
+            self._latest_depth = None
 
-        bgr_numpy = np.asanyarray(color_frame.get_data())
+        bgr_numpy = np.asanyarray(color_frame.get_data()).copy()
 
         if self._enable_webrtc:
             self._webrtc_buffer.write(bgr_numpy)
@@ -984,6 +1052,37 @@ class RealSenseCamera(BaseCamera):
         if self._latest_depth is None:
             return None
         return self._latest_depth.tobytes()
+
+    def enable_depth_zmq(self):
+        return (
+            self._enable_depth
+            and self._depth_zmq_port is not None
+            and self._depth_zmq_buffer is not None
+        )
+
+    def get_depth_png_bytes(self):
+        if self._depth_zmq_buffer is None:
+            return None
+
+        return self._depth_zmq_buffer.read()
+
+    def get_depth_zmq_port(self):
+        return self._depth_zmq_port
+
+    def enable_raw_depth_zmq(self):
+        return (
+            self._enable_depth
+            and self._raw_depth_zmq_port is not None
+            and self._raw_depth_zmq_buffer is not None
+        )
+
+    def get_raw_depth_png_bytes(self):
+        if self._raw_depth_zmq_buffer is None:
+            return None
+        return self._raw_depth_zmq_buffer.read()
+
+    def get_raw_depth_zmq_port(self):
+        return self._raw_depth_zmq_port
 
     def release(self):
         try:
@@ -1213,6 +1312,7 @@ class ImageServer:
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
         self._publisher_threads = []  # keep references for graceful join
 
+
         try:
             # Load cameras from self.cam_config
             for cam_topic, cam_cfg in self._cam_config.items():
@@ -1233,6 +1333,9 @@ class ImageServer:
                 video_path = f"/dev/video{video_id}" if video_id else None
                 physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
                 serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
+                enable_depth = cam_cfg.get("enable_depth", False)
+                depth_zmq_port = cam_cfg.get("depth_zmq_port", None)
+                raw_depth_zmq_port = cam_cfg.get("raw_depth_zmq_port")
 
                 if cam_type == "opencv":
                     if physical_path is not None:
@@ -1273,9 +1376,20 @@ class ImageServer:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
                     else:
-                        self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
-                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
-
+                        self._cameras[cam_topic] = RealSenseCamera(
+                            cam_topic=cam_topic,
+                            serial_number=serial_number,
+                            img_shape=img_shape,
+                            fps=fps,
+                            enable_zmq=enable_zmq,
+                            zmq_port=zmq_port,
+                            enable_webrtc=enable_webrtc,
+                            webrtc_port=webrtc_port,
+                            webrtc_codec=webrtc_codec,
+                            enable_depth=enable_depth,
+                            depth_zmq_port=depth_zmq_port,
+                            raw_depth_zmq_port=raw_depth_zmq_port,
+                        )
                 elif cam_type == "uvc":
                     uid = None
                     if physical_path is not None:
@@ -1350,6 +1464,7 @@ class ImageServer:
             logger_mp.error(f"[Image Server] Failed to update frames for {cam_topic} camera: {e}")
             self._stop_event.set()
 
+    #new
     def _zmq_pub(self, cam_topic: str, camera: BaseCamera):
         try:
             interval = 1.0 / camera.get_fps()
@@ -1373,6 +1488,74 @@ class ImageServer:
         except Exception as e:
             logger_mp.error(f"[Image Server] Failed to publish zmq frame from {cam_topic} camera.")
             self._stop_event.set()
+
+    def _depth_zmq_pub(self, cam_topic: str, camera: RealSenseCamera):
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+
+            logger_mp.info(
+                f"[Image Server] Publishing {cam_topic} depth "
+                f"on ZMQ port {camera.get_depth_zmq_port()}."
+            )
+
+            while not self._stop_event.is_set():
+                depth_png = camera.get_depth_png_bytes()
+
+                if depth_png is not None:
+                    self._zmq_publisher_manager.publish(
+                        depth_png,
+                        camera.get_depth_zmq_port(),
+                    )
+
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+
+        except Exception as e:
+            logger_mp.error(
+                f"[Image Server] Failed to publish depth from "
+                f"{cam_topic}: {e}"
+            )
+            self._stop_event.set()
+
+    def _raw_depth_zmq_pub(self, cam_topic: str, camera: RealSenseCamera):
+            try:
+                interval = 1.0 / camera.get_fps()
+                next_frame_time = time.monotonic()
+
+                logger_mp.info(
+                    f"[Image Server] Publishing {cam_topic} raw depth "
+                    f"on ZMQ port {camera.get_raw_depth_zmq_port()}."
+                )
+
+                while not self._stop_event.is_set():
+                    raw_depth_png = camera.get_raw_depth_png_bytes()
+
+                    if raw_depth_png is not None:
+                        self._zmq_publisher_manager.publish(
+                            raw_depth_png,
+                            camera.get_raw_depth_zmq_port(),
+                        )
+
+                    next_frame_time += interval
+                    sleep_time = next_frame_time - time.monotonic()
+
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    else:
+                        next_frame_time = time.monotonic()
+
+            except Exception as e:
+                logger_mp.error(
+                    f"[Image Server] Failed to publish raw depth from "
+                    f"{cam_topic}: {e}"
+                )
+                self._stop_event.set()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
         try:
@@ -1433,7 +1616,8 @@ class ImageServer:
                 self._stop_event.set()
                 self._clean_up()
                 return
-            t = threading.Thread(target=self._update_frames, args=(camera_topic, camera), daemon=True)
+            t = threading.Thread(target=self._update_frames,
+                                 args=(camera_topic, camera), daemon=True)
             t.start()
             self._publisher_threads.append(t)
         if self._isaacsim_enable:
@@ -1462,6 +1646,27 @@ class ImageServer:
                 t = threading.Thread(target=self._zmq_pub, args=(camera_topic, camera), daemon=True)
                 t.start()
                 self._publisher_threads.append(t)
+
+            if (isinstance(camera, RealSenseCamera) and camera.enable_depth_zmq()):
+                t = threading.Thread(
+                    target=self._depth_zmq_pub,
+                    args=(camera_topic, camera),
+                    daemon=True,
+                )
+                t.start()
+                self._publisher_threads.append(t)
+
+            if (
+                isinstance(camera, RealSenseCamera)
+                and camera.enable_raw_depth_zmq()
+            ):
+                thread = threading.Thread(
+                    target=self._raw_depth_zmq_pub,
+                    args=(camera_topic, camera),
+                    daemon=True,
+                )
+                thread.start()
+                self._publisher_threads.append(thread)
 
     def wait(self):
         self._stop_event.wait()
