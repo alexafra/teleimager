@@ -944,7 +944,7 @@ class RealSenseCamera(BaseCamera):
             if self._enable_depth:
                 assert self._device is not None
                 depth_sensor = self._device.first_depth_sensor()
-                self.g_depth_scale = depth_sensor.get_depth_scale()
+                self.g_depth_scale = float(depth_sensor.get_depth_scale())
 
             self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             logger_mp.info(str(self))
@@ -1307,7 +1307,7 @@ class ImageServer:
         self._cameras: dict[str, BaseCamera] = {}
         if not self._isaacsim_enable:
             self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
-        self._responser = ZMQ_Responser(self._cam_config)
+        self._responser = None
         self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
         self._publisher_threads = []  # keep references for graceful join
@@ -1390,6 +1390,10 @@ class ImageServer:
                             depth_zmq_port=depth_zmq_port,
                             raw_depth_zmq_port=raw_depth_zmq_port,
                         )
+                        if enable_depth:
+                            cam_cfg["depth_scale_m_per_unit"] = (
+                                self._cameras[cam_topic].g_depth_scale
+                            )
                 elif cam_type == "uvc":
                     uid = None
                     if physical_path is not None:
@@ -1441,6 +1445,7 @@ class ImageServer:
             self._clean_up()
             raise
 
+        self._responser = ZMQ_Responser(self._cam_config)
         logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
 
     def _update_frames(self, cam_topic: str, camera: BaseCamera):
@@ -1581,9 +1586,10 @@ class ImageServer:
         except Exception as e:
             logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
             self._stop_event.set()
-
+    
     def _clean_up(self):
-        self._responser.stop()
+        if self._responser is not None:
+            self._responser.stop()
         for t in self._publisher_threads:
             if t.is_alive():
                 t.join(timeout=1.0)
