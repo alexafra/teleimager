@@ -30,6 +30,13 @@ import yaml
 import os
 from collections import deque
 import logging_mp
+
+from .rgbd_protocol import (
+    RGBD_PROTOCOL,
+    TeleRgbdFrame,
+    unpack_rgbd_packet,
+)
+
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
@@ -111,7 +118,11 @@ class ZMQ_PublisherThread(threading.Thread):
         self._context = context
         self._socket = None
         self._running = True
-        self._queue = queue.Queue(maxsize=10)  # Limit queue size to prevent memory issues
+        # Live camera data becomes stale as soon as a newer frame arrives. The
+        # socket HWM does not constrain this application queue, so keep only
+        # the newest pending value here as well.
+        self._queue = queue.Queue(maxsize=1)
+        self._queue_lock = threading.Lock()
         self._started = threading.Event()
 
     def send(self, data: Any) -> None:
@@ -124,18 +135,27 @@ class ZMQ_PublisherThread(threading.Thread):
             raise TypeError(f"PublisherThread expects bytes, got {type(data)}")
 
         try:
-            self._queue.put_nowait(data)
-        except queue.Full:
-            logger_mp.warning(f"Publisher queue full for {self._host}:{self._port}, dropping message")
+            with self._queue_lock:
+                if not self._running:
+                    return
+                if self._queue.full():
+                    with contextlib.suppress(queue.Empty):
+                        self._queue.get_nowait()
+                self._queue.put_nowait(data)
         except Exception as e:
-            logger_mp.error(f"Error serializing data for publisher: {e}")
+            logger_mp.error(f"Error queuing data for publisher: {e}")
 
     def stop(self) -> None:
         """Stop the publisher thread gracefully."""
-        self._running = False
-        # Put a sentinel value(None) to unblock the queue if needed
-        with contextlib.suppress(queue.Full):
-            self._queue.put_nowait(None)
+        with self._queue_lock:
+            self._running = False
+            # Replace any pending image with a sentinel so shutdown never waits
+            # for stale data to be published.
+            if self._queue.full():
+                with contextlib.suppress(queue.Empty):
+                    self._queue.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._queue.put_nowait(None)
         self.join(timeout=1)
         if self.is_alive():
             logger_mp.warning("Publisher thread did not stop gracefully")
@@ -157,7 +177,7 @@ class ZMQ_PublisherThread(threading.Thread):
                     data = self._queue.get(timeout=0.1)
 
                     # Check for sentinel value
-                    if data is None:
+                    if data is None or not self._running:
                         break
 
                     try:
@@ -285,12 +305,19 @@ class ZMQ_PublisherManager:
 # ========================================================
 class TeleImage:
     _NOT_SET = object()
-    __slots__ = ['jpg', '_bgr', 'fps']
+    __slots__ = ['jpg', '_bgr', 'fps', 'received_monotonic_ns']
 
-    def __init__(self, fps: float, jpg: Optional[bytes], bgr: Any = _NOT_SET):
+    def __init__(
+        self,
+        fps: float,
+        jpg: Optional[bytes],
+        bgr: Any = _NOT_SET,
+        received_monotonic_ns: Optional[int] = None,
+    ):
         self.fps = fps
         self.jpg = jpg
         self._bgr = bgr
+        self.received_monotonic_ns = received_monotonic_ns
 
     @property
     def bgr(self) -> Optional[np.ndarray]:
@@ -320,7 +347,38 @@ class TeleImage:
         """ String representation for debugging """
         size = len(self.jpg) if self.jpg else 0
         state = "DISABLED" if self._bgr is TeleImage._NOT_SET else ("FAILED" if self._bgr is None else "OK")
-        return f"TeleImage(fps={self.fps:.1f}, jpg_byte_size={size}, bgr_state={state})"
+        return (
+            f"TeleImage(fps={self.fps:.1f}, jpg_byte_size={size}, "
+            f"bgr_state={state}, received_monotonic_ns={self.received_monotonic_ns})"
+        )
+
+
+def decode_rgbd_frame(frame: TeleRgbdFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """Decode and validate a paired colour JPEG and aligned uint16-depth PNG."""
+
+    color_bgr = cv2.imdecode(
+        np.frombuffer(frame.color_jpeg, dtype=np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+    if color_bgr is None or color_bgr.ndim != 3 or color_bgr.shape[2] != 3:
+        raise ValueError("Paired RGBD packet contains an invalid colour JPEG")
+
+    aligned_depth = cv2.imdecode(
+        np.frombuffer(frame.aligned_depth_png, dtype=np.uint8),
+        cv2.IMREAD_UNCHANGED,
+    )
+    if (
+        aligned_depth is None
+        or aligned_depth.dtype != np.uint16
+        or aligned_depth.ndim != 2
+    ):
+        raise ValueError("Paired RGBD packet does not contain a uint16 depth PNG")
+    if color_bgr.shape[:2] != aligned_depth.shape:
+        raise ValueError(
+            "Paired RGBD colour and aligned-depth image shapes do not match: "
+            f"{color_bgr.shape[:2]} vs {aligned_depth.shape}"
+        )
+    return color_bgr, aligned_depth
         
 
 class ZMQ_SubscriberThread(threading.Thread):
@@ -393,12 +451,26 @@ class ZMQ_SubscriberThread(threading.Thread):
             The latest message as a TeleImage object containing raw bytes, decoded BGR image (if enabled), and FPS.
         """
         current_fps = self._fps_monitor.fps
-        jpg_data = self._jpg_3ring_buffer.read()
+        received = self._jpg_3ring_buffer.read()
+        if received is None:
+            jpg_data = None
+            received_monotonic_ns = None
+        else:
+            jpg_data, received_monotonic_ns = received
         if not self._request_bgr:
-            return TeleImage(fps=current_fps, jpg=jpg_data)
+            return TeleImage(
+                fps=current_fps,
+                jpg=jpg_data,
+                received_monotonic_ns=received_monotonic_ns,
+            )
 
         bgr_data = self._bgr_3ring_buffer.read()
-        return TeleImage(fps=current_fps, jpg=jpg_data, bgr=bgr_data)
+        return TeleImage(
+            fps=current_fps,
+            jpg=jpg_data,
+            bgr=bgr_data,
+            received_monotonic_ns=received_monotonic_ns,
+        )
 
     def stop(self) -> None:
         """Stop the subscriber thread gracefully."""
@@ -428,8 +500,11 @@ class ZMQ_SubscriberThread(threading.Thread):
                     try:
                         # receive the latest message
                         img_bytes = self._socket.recv()
+                        received_monotonic_ns = time.monotonic_ns()
                         # write to 3-ring-buffer
-                        self._jpg_3ring_buffer.write(img_bytes)
+                        self._jpg_3ring_buffer.write(
+                            (img_bytes, received_monotonic_ns)
+                        )
                         # enqueue for decoding if needed
                         if self._request_bgr:
                             try:
@@ -675,12 +750,26 @@ class ZMQ_Requester:
 # image client
 # ========================================================
 class ImageClient:
-    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False):
+    def __init__(
+        self,
+        host="192.168.123.164",
+        request_port=60000,
+        request_bgr: bool = False,
+        eager_head_color: bool = True,
+        eager_aligned_depth: bool = True,
+        eager_raw_depth: bool = True,
+    ):
         """
         Args:
             server_address:   IP address of image host server
             request_port:     TCP port for camera configuration request
             request_bgr:      Whether to request BGR decoding for subscribers
+            eager_head_color: Start the legacy head-colour subscription
+                immediately. The getter still subscribes lazily when False.
+            eager_aligned_depth: Start the legacy aligned-depth subscription
+                immediately. The getter still subscribes lazily when False.
+            eager_raw_depth: Start the raw-depth subscription immediately. The
+                getter still subscribes lazily when False.
         """
         self._host = host
         self._request_port = request_port
@@ -688,18 +777,46 @@ class ImageClient:
 
         # subscriber and requester setup
         self._subscriber_manager = ZMQ_SubscriberManager.get_instance()
-        self._requester  = ZMQ_Requester(self._host, self._request_port)
-        self._cam_config = self._requester.request()
+        self._requester = None
+        try:
+            self._requester = ZMQ_Requester(self._host, self._request_port)
+            self._cam_config = self._requester.request()
+        finally:
+            if self._requester is not None:
+                self._requester.close()
+                self._requester = None
 
         if self._cam_config is None:
+            self._subscriber_manager.close()
             raise RuntimeError("Failed to get camera configuration.")
-        
-        if self._cam_config['head_camera']['enable_zmq']:
+
+        try:
+            self._subscribe_initial_streams(
+                eager_head_color=eager_head_color,
+                eager_aligned_depth=eager_aligned_depth,
+                eager_raw_depth=eager_raw_depth,
+            )
+        except Exception:
+            self._subscriber_manager.close()
+            raise
+
+    def _subscribe_initial_streams(
+        self,
+        *,
+        eager_head_color: bool,
+        eager_aligned_depth: bool,
+        eager_raw_depth: bool,
+    ) -> None:
+        if eager_head_color and self._cam_config['head_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
 
         head_config = self._cam_config["head_camera"]
 
-        if (head_config.get("enable_depth", False) and head_config.get("depth_zmq_port") is not None):
+        if (
+            eager_aligned_depth
+            and head_config.get("enable_depth", False)
+            and head_config.get("depth_zmq_port") is not None
+        ):
             self._subscriber_manager.subscribe(
                 self._host,
                 head_config["depth_zmq_port"],
@@ -707,7 +824,8 @@ class ImageClient:
             )
 
         if (
-            head_config.get("enable_depth", False)
+            eager_raw_depth
+            and head_config.get("enable_depth", False)
             and head_config.get("raw_depth_zmq_port") is not None
         ):
             self._subscriber_manager.subscribe(
@@ -722,8 +840,12 @@ class ImageClient:
         if self._cam_config['right_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
 
-        if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
-            logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
+        if (
+            not self._cam_config['head_camera']['enable_zmq']
+            and not self._cam_config['head_camera']['enable_webrtc']
+            and self._cam_config['head_camera'].get("rgbd_zmq_port") is None
+        ):
+            logger_mp.warning("[Image Client] NOTICE! No head-camera transport is enabled.")
 
     # --------------------------------------------------------
     # public api
@@ -733,6 +855,42 @@ class ImageClient:
 
     def get_head_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
+
+    def get_head_rgbd_frame(self) -> Optional[TeleRgbdFrame]:
+        """Return the latest atomic colour/aligned-depth capture, if configured.
+
+        The paired stream is subscribed lazily so colour-only clients do not
+        pay its bandwidth cost. Malformed or unsupported packets are never
+        treated as legacy images.
+        """
+
+        head_config = self._cam_config["head_camera"]
+        rgbd_port = head_config.get("rgbd_zmq_port")
+        if not head_config.get("enable_depth", False) or rgbd_port is None:
+            return None
+        if head_config.get("rgbd_protocol") != RGBD_PROTOCOL:
+            logger_mp.debug(
+                f"[Image Client] Unsupported RGBD protocol: "
+                f"{head_config.get('rgbd_protocol')!r}"
+            )
+            return None
+
+        message = self._subscriber_manager.subscribe(
+            self._host,
+            rgbd_port,
+            request_bgr=False,
+        )
+        if message.jpg is None:
+            return None
+
+        try:
+            return unpack_rgbd_packet(
+                message.jpg,
+                received_monotonic_ns=message.received_monotonic_ns,
+            )
+        except (TypeError, ValueError) as exc:
+            logger_mp.debug(f"[Image Client] Rejected malformed RGBD packet: {exc}")
+            return None
     
     def get_head_depth_frame(self):
         head_config = self._cam_config["head_camera"]

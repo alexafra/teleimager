@@ -220,8 +220,49 @@ You will see separate OpenCV windows showing each camera stream.
 > Ensure `opencv-python` is installed.
 
 
+### 2.2 Experimental capture-synchronised RGBD (RealSense, opt-in)
 
-### 2.2 🌀 Using WebRTC
+The repository configuration uses the established independent colour and depth
+ports by default. To experiment with the additive atomic RGBD transport, keep
+`enable_depth: true` and add these two lines to the RealSense camera entry in
+`cam_config_server.yaml`:
+
+```yaml
+head_camera:
+  rgbd_zmq_port: 5560
+  rgbd_protocol: teleimager-rgbd-v1
+```
+
+Each versioned message contains a colour JPEG and its aligned `uint16` depth
+PNG produced from the same RealSense SDK frameset, along with a monotonically
+increasing server sequence. Opting in does not replace or alter the existing
+colour, aligned-depth, and raw-depth ports.
+
+```python
+from teleimager.image_client import ImageClient, decode_rgbd_frame
+
+client = ImageClient(
+    host="192.168.123.164",
+    eager_head_color=False,
+    eager_aligned_depth=False,
+    eager_raw_depth=False,
+)
+frame = client.get_head_rgbd_frame()
+if frame is not None:
+    color_bgr, aligned_depth_u16 = decode_rgbd_frame(frame)
+    print(frame.sequence, frame.received_monotonic_ns)
+```
+
+The paired subscription is lazy. `received_monotonic_ns` is measured on the
+client and can be used for local freshness checks. Do not subtract the server
+timestamp from it: monotonic clocks on different hosts are unrelated. This
+stream establishes same-frameset transport pairing; it does not claim the RGB
+and depth sensors had identical exposure times. Raw depth remains on its legacy
+independent port and is not part of the version-1 atomic packet.
+
+
+
+### 2.3 🌀 Using WebRTC
 
 For WebRTC streams, open a browser:
 

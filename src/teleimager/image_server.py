@@ -32,6 +32,7 @@ import functools
 import subprocess
 import platform
 from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
+from .rgbd_protocol import RGBD_PROTOCOL, pack_rgbd_packet
 # webrtc dependencies
 import asyncio
 import json
@@ -56,6 +57,89 @@ CONFIG_PATH = os.path.join(
     "..", "..", "cam_config_server.yaml"
 )
 CONFIG_PATH = os.path.normpath(CONFIG_PATH)
+
+
+_CONFIG_RESPONDER_PORT = 60000
+_CONFIGURED_TRANSPORT_PORT_KEYS = (
+    "zmq_port",
+    "depth_zmq_port",
+    "raw_depth_zmq_port",
+    "webrtc_port",
+    "rgbd_zmq_port",
+)
+
+
+def _configured_transport_ports(cam_config):
+    """Index configured camera ports for optional RGBD collision checks."""
+
+    configured_ports = {_CONFIG_RESPONDER_PORT: ["config_responder"]}
+    for topic, camera_config in cam_config.items():
+        for key in _CONFIGURED_TRANSPORT_PORT_KEYS:
+            port = camera_config.get(key)
+            if isinstance(port, bool) or not isinstance(port, int):
+                continue
+            configured_ports.setdefault(port, []).append(f"{topic}.{key}")
+    return configured_ports
+
+
+def _validated_rgbd_zmq_port(
+    cam_topic,
+    cam_cfg,
+    cam_type,
+    *,
+    configured_ports=None,
+):
+    """Return a usable atomic RGBD port, stripping optional invalid config.
+
+    RGBD is additive to the legacy streams. A typo or unsupported camera type
+    must therefore disable only this capability, and the config responder must
+    not advertise a stream the server did not bind.
+    """
+
+    has_port = "rgbd_zmq_port" in cam_cfg
+    has_protocol = "rgbd_protocol" in cam_cfg
+    if not has_port and not has_protocol:
+        return None
+
+    port = cam_cfg.get("rgbd_zmq_port")
+    protocol = cam_cfg.get("rgbd_protocol")
+    invalid_reason = None
+    if cam_type != "realsense":
+        invalid_reason = f"camera type {cam_type!r} has no aligned-depth RGBD source"
+    elif not cam_cfg.get("enable_depth", False):
+        invalid_reason = "enable_depth is false"
+    elif isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        invalid_reason = f"rgbd_zmq_port {port!r} is not a valid TCP port"
+    elif protocol != RGBD_PROTOCOL:
+        invalid_reason = (
+            f"rgbd_protocol {protocol!r} is not the supported {RGBD_PROTOCOL!r}"
+        )
+    else:
+        if configured_ports is None:
+            configured_ports = _configured_transport_ports({cam_topic: cam_cfg})
+        own_port_name = f"{cam_topic}.rgbd_zmq_port"
+        collisions = [
+            configured_name
+            for configured_name in configured_ports.get(port, ())
+            if configured_name != own_port_name
+        ]
+        if collisions:
+            invalid_reason = (
+                f"rgbd_zmq_port {port} collides with "
+                f"{', '.join(collisions)}"
+            )
+
+    if invalid_reason is not None:
+        cam_cfg.pop("rgbd_zmq_port", None)
+        cam_cfg.pop("rgbd_protocol", None)
+        logger_mp.warning(
+            f"[Image Server] Disabling optional atomic RGBD for {cam_topic}: "
+            f"{invalid_reason}. Legacy streams remain enabled."
+        )
+        return None
+
+    return port
+
 
 # ========================================================
 # certificate and key paths
@@ -905,7 +989,7 @@ class BaseCamera:
 class RealSenseCamera(BaseCamera):
     def __init__(self, cam_topic, serial_number, img_shape, fps, 
                  enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False,
-                 depth_zmq_port=None, raw_depth_zmq_port=None,):
+                 depth_zmq_port=None, raw_depth_zmq_port=None, rgbd_zmq_port=None,):
         rs = self.check_pyrealsense2_install()
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
         self._serial_number = serial_number
@@ -924,7 +1008,14 @@ class RealSenseCamera(BaseCamera):
             TripleRingBuffer()
             if self._enable_depth and raw_depth_zmq_port is not None
             else None
-)
+        )
+        self._rgbd_zmq_port = rgbd_zmq_port
+        self._rgbd_zmq_buffer = (
+            TripleRingBuffer()
+            if self._enable_depth and self._rgbd_zmq_port is not None
+            else None
+        )
+        self._capture_sequence = 0
 
         try:
             align_to = rs.stream.color
@@ -976,12 +1067,16 @@ class RealSenseCamera(BaseCamera):
     
     def _update_frame(self):
         frames = self.pipeline.wait_for_frames()
+        self._capture_sequence += 1
+        capture_sequence = self._capture_sequence
+        server_capture_monotonic_ns = time.monotonic_ns()
         aligned_frames = self.align.process(frames)
         color_frame = aligned_frames.get_color_frame()
 
         if not color_frame:
             return None
 
+        aligned_depth_png_bytes = None
         if self._enable_depth:   
             raw_depth_frame = frames.get_depth_frame()
 
@@ -1014,7 +1109,10 @@ class RealSenseCamera(BaseCamera):
             if depth_frame:
                 self._latest_depth = np.asanyarray(depth_frame.get_data()).copy()
 
-                if self._depth_zmq_buffer is not None:
+                if (
+                    self._depth_zmq_buffer is not None
+                    or self._rgbd_zmq_buffer is not None
+                ):
                     encoded, depth_png = cv2.imencode(
                         ".png",
                         self._latest_depth,
@@ -1022,7 +1120,9 @@ class RealSenseCamera(BaseCamera):
                     )
 
                     if encoded:
-                        self._depth_zmq_buffer.write(depth_png.tobytes())
+                        aligned_depth_png_bytes = depth_png.tobytes()
+                        if self._depth_zmq_buffer is not None:
+                            self._depth_zmq_buffer.write(aligned_depth_png_bytes)
                     else:
                         logger_mp.warning(
                             f"[RealSenseCamera: {self._cam_topic}] "
@@ -1040,10 +1140,41 @@ class RealSenseCamera(BaseCamera):
         if self._enable_webrtc:
             self._webrtc_buffer.write(bgr_numpy)
 
-        if self._enable_zmq:
+        color_jpeg_bytes = None
+        if self._enable_zmq or self._rgbd_zmq_buffer is not None:
             ok, buf = cv2.imencode(".jpg", bgr_numpy)
             if ok:
-                self._zmq_buffer.write(buf.tobytes())
+                color_jpeg_bytes = buf.tobytes()
+                if self._enable_zmq:
+                    self._zmq_buffer.write(color_jpeg_bytes)
+            else:
+                logger_mp.warning(
+                    f"[RealSenseCamera: {self._cam_topic}] "
+                    "Failed to encode colour frame."
+                )
+
+        if (
+            self._rgbd_zmq_buffer is not None
+            and color_jpeg_bytes is not None
+            and aligned_depth_png_bytes is not None
+        ):
+            try:
+                packet = pack_rgbd_packet(
+                    capture_sequence,
+                    server_capture_monotonic_ns,
+                    color_jpeg_bytes,
+                    aligned_depth_png_bytes,
+                )
+                self._rgbd_zmq_buffer.write((capture_sequence, packet))
+            except Exception as e:
+                # RGBD is additive. Disable only this optional path if packet
+                # construction fails, leaving the already-written legacy
+                # colour/depth frames available.
+                self._rgbd_zmq_buffer = None
+                logger_mp.error(
+                    f"[RealSenseCamera: {self._cam_topic}] Failed to construct "
+                    f"an atomic RGBD packet; disabling RGBD: {e}"
+                )
         
         if not self._ready.is_set():
             self._ready.set()
@@ -1083,6 +1214,21 @@ class RealSenseCamera(BaseCamera):
 
     def get_raw_depth_zmq_port(self):
         return self._raw_depth_zmq_port
+
+    def enable_rgbd_zmq(self):
+        return (
+            self._enable_depth
+            and self._rgbd_zmq_port is not None
+            and self._rgbd_zmq_buffer is not None
+        )
+
+    def get_rgbd_packet(self):
+        if self._rgbd_zmq_buffer is None:
+            return None
+        return self._rgbd_zmq_buffer.read()
+
+    def get_rgbd_zmq_port(self):
+        return self._rgbd_zmq_port
 
     def release(self):
         try:
@@ -1315,10 +1461,8 @@ class ImageServer:
 
         try:
             # Load cameras from self.cam_config
+            configured_ports = _configured_transport_ports(self._cam_config)
             for cam_topic, cam_cfg in self._cam_config.items():
-                if not cam_cfg.get("enable_zmq", False) and not cam_cfg.get("enable_webrtc", False):
-                    continue
-
                 enable_zmq = cam_cfg.get("enable_zmq", False)
                 zmq_port = cam_cfg.get("zmq_port", None)
                 enable_webrtc = cam_cfg.get("enable_webrtc", False)
@@ -1327,6 +1471,14 @@ class ImageServer:
                 cam_type = cam_cfg.get("type", "uvc").lower()
                 if self._isaacsim_enable and cam_type!="isaacsim":
                     cam_type = "isaacsim"
+                rgbd_zmq_port = _validated_rgbd_zmq_port(
+                    cam_topic,
+                    cam_cfg,
+                    cam_type,
+                    configured_ports=configured_ports,
+                )
+                if not enable_zmq and not enable_webrtc and rgbd_zmq_port is None:
+                    continue
                 img_shape = cam_cfg.get("image_shape", None)
                 fps = cam_cfg.get("fps", 30)
                 video_id = cam_cfg.get("video_id", "0")
@@ -1389,6 +1541,7 @@ class ImageServer:
                             enable_depth=enable_depth,
                             depth_zmq_port=depth_zmq_port,
                             raw_depth_zmq_port=raw_depth_zmq_port,
+                            rgbd_zmq_port=rgbd_zmq_port,
                         )
                         if enable_depth:
                             cam_cfg["depth_scale_m_per_unit"] = (
@@ -1561,6 +1714,41 @@ class ImageServer:
                     f"{cam_topic}: {e}"
                 )
                 self._stop_event.set()
+
+    def _rgbd_zmq_pub(self, cam_topic: str, camera: RealSenseCamera):
+        """Publish each atomic RGBD capture at most once."""
+
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+            last_sequence = None
+            logger_mp.info(
+                f"[Image Server] Publishing atomic {cam_topic} RGBD "
+                f"on ZMQ port {camera.get_rgbd_zmq_port()}."
+            )
+
+            while not self._stop_event.is_set():
+                rgbd_item = camera.get_rgbd_packet()
+                if rgbd_item is not None:
+                    sequence, packet = rgbd_item
+                    if sequence != last_sequence:
+                        self._zmq_publisher_manager.publish(
+                            packet,
+                            camera.get_rgbd_zmq_port(),
+                        )
+                        last_sequence = sequence
+
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            logger_mp.error(
+                f"[Image Server] Failed to publish atomic RGBD from "
+                f"{cam_topic}: {e}. Legacy streams remain enabled."
+            )
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
         try:
@@ -1668,6 +1856,18 @@ class ImageServer:
             ):
                 thread = threading.Thread(
                     target=self._raw_depth_zmq_pub,
+                    args=(camera_topic, camera),
+                    daemon=True,
+                )
+                thread.start()
+                self._publisher_threads.append(thread)
+
+            if (
+                isinstance(camera, RealSenseCamera)
+                and camera.enable_rgbd_zmq()
+            ):
+                thread = threading.Thread(
+                    target=self._rgbd_zmq_pub,
                     args=(camera_topic, camera),
                     daemon=True,
                 )

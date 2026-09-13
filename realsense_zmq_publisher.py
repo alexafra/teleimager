@@ -13,20 +13,20 @@ in ~/teleimager — plus pyrealsense2, which is already present at
 
 Wire-compatible with the stock `teleimager-client`: publishes JPEG-encoded
 frames on the head_camera zmq_port from cam_config_server.yaml (5555), and
-serves that same config over a ZMQ_Responser on port 60000 so the client's
-config auto-discovery (ImageClient.__init__ -> ZMQ_Requester.request())
-works without any client-side changes.
+serves a colour-only copy of that config over a ZMQ_Responser on port 60000 so
+the client's config auto-discovery (ImageClient.__init__ ->
+ZMQ_Requester.request()) works without any client-side changes.
 
 Usage (on the robot):
     python3 realsense_zmq_publisher.py
 Ctrl+C to stop.
 """
 
+import copy
 import time
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
 import yaml
 
 from teleimager.image_client import ZMQ_PublisherManager, ZMQ_Responser
@@ -35,9 +35,28 @@ CONFIG_PATH = "/home/unitree/teleimager/cam_config_server.yaml"
 JPEG_QUALITY = 80
 
 
+def as_color_only_config(cam_config):
+    """Return a config that advertises only streams this fallback publishes."""
+
+    cam_config = copy.deepcopy(cam_config)
+    head_cfg = cam_config["head_camera"]
+    head_cfg["enable_depth"] = False
+    for unsupported_key in (
+        "depth_zmq_port",
+        "raw_depth_zmq_port",
+        "rgbd_zmq_port",
+        "rgbd_protocol",
+        "depth_scale_m_per_unit",
+    ):
+        head_cfg.pop(unsupported_key, None)
+    return cam_config
+
+
 def main():
+    import pyrealsense2 as rs
+
     with open(CONFIG_PATH) as f:
-        cam_config = yaml.safe_load(f)
+        cam_config = as_color_only_config(yaml.safe_load(f))
 
     head_cfg = cam_config["head_camera"]
     height, width = head_cfg["image_shape"]  # yaml stores [rows, cols] i.e. [H, W]
