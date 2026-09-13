@@ -30,6 +30,7 @@ import yaml
 import os
 from collections import deque
 import logging_mp
+from teleimager.geometry_preview import encode_depth_gray_rgb, encode_surface_normals_rgb
 
 from .rgbd_protocol import (
     RGBD_PROTOCOL,
@@ -998,6 +999,14 @@ def main():
     # Example usage with three camera streams
     client = ImageClient(host=args.host, request_bgr=True)
     cam_config = client.get_cam_config()
+    head_config = cam_config['head_camera']
+    show_geometry = bool(
+        head_config.get('enable_depth', False)
+        and head_config.get('depth_zmq_port') is not None
+    )
+    depth_scale = head_config.get('depth_scale_m_per_unit')
+    if show_geometry and depth_scale is None:
+        raise RuntimeError("Camera config is missing depth_scale_m_per_unit")
 
     running = True
     while running:
@@ -1007,7 +1016,23 @@ def main():
                 logger_mp.info(f"Head Camera FPS: {head_img.fps:.2f}")
                 logger_mp.debug(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
                 logger_mp.debug(f"Head Camera Binocular: {cam_config['head_camera']['binocular']}")
-                cv2.imshow("Head Camera", head_img.bgr)
+                cv2.imshow("Head RGB", head_img.bgr)
+                if show_geometry:
+                    aligned_depth = client.get_head_depth_frame()
+                    if aligned_depth is not None:
+                        depth_gray_rgb = encode_depth_gray_rgb(
+                            aligned_depth,
+                            scale_m_per_unit=depth_scale,
+                        )
+                        normals_rgb = encode_surface_normals_rgb(
+                            aligned_depth,
+                            scale_m_per_unit=depth_scale,
+                        )
+                        cv2.imshow("Head Depth Gray (GR00T)", depth_gray_rgb)
+                        cv2.imshow(
+                            "Head Surface Normals (GR00T)",
+                            cv2.cvtColor(normals_rgb, cv2.COLOR_RGB2BGR),
+                        )
 
         if cam_config['left_wrist_camera']['enable_zmq']:
             left_wrist_img = client.get_left_wrist_frame()
