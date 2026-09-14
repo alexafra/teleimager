@@ -16,7 +16,9 @@ logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
 import os
 import argparse
+import copy
 import glob
+import hashlib
 import cv2
 import numpy as np
 # uvc will be imported when needed
@@ -60,6 +62,8 @@ CONFIG_PATH = os.path.normpath(CONFIG_PATH)
 
 
 _CONFIG_RESPONDER_PORT = 60000
+CANONICAL_DEPTH_SCALE_M_PER_UNIT = 0.001
+REALSENSE_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
 _CONFIGURED_TRANSPORT_PORT_KEYS = (
     "zmq_port",
     "depth_zmq_port",
@@ -67,6 +71,113 @@ _CONFIGURED_TRANSPORT_PORT_KEYS = (
     "webrtc_port",
     "rgbd_zmq_port",
 )
+
+
+def _validated_realsense_depth_scale(reported_scale_m_per_unit):
+    """Validate the SDK value while returning the canonical processing scale.
+
+    librealsense reports the D435I's millimetre scale as the full Python float
+    spelling ``0.0010000000474974513``. It is the same IEEE-754 float32 value
+    as ``0.001``. Processing and persisted metadata use the short canonical
+    value; the original SDK value remains available as provenance only.
+    """
+
+    try:
+        reported = float(reported_scale_m_per_unit)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "RealSense depth scale must be a finite number"
+        ) from error
+
+    if not np.isfinite(reported):
+        raise ValueError("RealSense depth scale must be a finite number")
+    if np.float32(reported) != np.float32(CANONICAL_DEPTH_SCALE_M_PER_UNIT):
+        raise ValueError(
+            "RealSense depth scale is incompatible with the canonical "
+            f"{CANONICAL_DEPTH_SCALE_M_PER_UNIT} m/unit processing contract: "
+            f"SDK reported {reported!r}"
+        )
+    return CANONICAL_DEPTH_SCALE_M_PER_UNIT, reported
+
+
+def _realsense_profile_calibration(video_profile):
+    """Return JSON-safe active profile and intrinsic calibration metadata."""
+
+    intrinsics = video_profile.get_intrinsics()
+    format_name = str(video_profile.format())
+    if format_name.startswith("format."):
+        format_name = format_name[len("format."):]
+    return {
+        "width": int(intrinsics.width),
+        "height": int(intrinsics.height),
+        "fx": float(intrinsics.fx),
+        "fy": float(intrinsics.fy),
+        "cx": float(intrinsics.ppx),
+        "cy": float(intrinsics.ppy),
+        "distortion": str(intrinsics.model),
+        "coeffs": [float(value) for value in intrinsics.coeffs],
+        "format": format_name,
+        "fps": int(video_profile.fps()),
+    }
+
+
+def _required_realsense_device_info(rs, device, key, label):
+    if not device.supports(key):
+        raise RuntimeError(f"RealSense device does not report {label}")
+    value = str(device.get_info(key))
+    if not value:
+        raise RuntimeError(f"RealSense device reported an empty {label}")
+    return value
+
+
+def _realsense_calibration(rs, device, color_profile, depth_profile):
+    """Build the canonical active RGB-D calibration and its fingerprint."""
+
+    extrinsics = depth_profile.get_extrinsics_to(color_profile)
+    calibration = {
+        "schema": REALSENSE_CALIBRATION_SCHEMA,
+        "camera": {
+            "model": _required_realsense_device_info(
+                rs, device, rs.camera_info.name, "model"
+            ),
+            "serial": _required_realsense_device_info(
+                rs, device, rs.camera_info.serial_number, "serial number"
+            ),
+            "product_id": _required_realsense_device_info(
+                rs, device, rs.camera_info.product_id, "product ID"
+            ),
+            "firmware": _required_realsense_device_info(
+                rs, device, rs.camera_info.firmware_version, "firmware version"
+            ),
+        },
+        "color": _realsense_profile_calibration(color_profile),
+        "depth": _realsense_profile_calibration(depth_profile),
+        "depth_to_color": {
+            "rotation": [float(value) for value in extrinsics.rotation],
+            "translation_m": [float(value) for value in extrinsics.translation],
+        },
+    }
+    canonical_json = json.dumps(
+        calibration,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    calibration["fingerprint"] = (
+        f"sha256:{hashlib.sha256(canonical_json).hexdigest()}"
+    )
+    return calibration
+
+
+def _advertise_realsense_depth_metadata(cam_cfg, camera):
+    """Attach canonical processing and calibration metadata to live config."""
+
+    cam_cfg["depth_scale_m_per_unit"] = CANONICAL_DEPTH_SCALE_M_PER_UNIT
+    cam_cfg["depth_scale_reported_m_per_unit"] = (
+        camera.depth_scale_reported_m_per_unit
+    )
+    cam_cfg["calibration"] = copy.deepcopy(camera.calibration)
 
 
 def _configured_transport_ports(cam_config):
@@ -1035,9 +1146,27 @@ class RealSenseCamera(BaseCamera):
             if self._enable_depth:
                 assert self._device is not None
                 depth_sensor = self._device.first_depth_sensor()
-                self.g_depth_scale = float(depth_sensor.get_depth_scale())
+                (
+                    self.g_depth_scale,
+                    self.depth_scale_reported_m_per_unit,
+                ) = _validated_realsense_depth_scale(
+                    depth_sensor.get_depth_scale()
+                )
 
-            self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            color_profile = profile.get_stream(
+                rs.stream.color
+            ).as_video_stream_profile()
+            self.intrinsics = color_profile.get_intrinsics()
+            if self._enable_depth:
+                depth_profile = profile.get_stream(
+                    rs.stream.depth
+                ).as_video_stream_profile()
+                self.calibration = _realsense_calibration(
+                    rs,
+                    self._device,
+                    color_profile,
+                    depth_profile,
+                )
             logger_mp.info(str(self))
         except Exception as e:
             if self.pipeline:
@@ -1053,7 +1182,7 @@ class RealSenseCamera(BaseCamera):
             f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
             f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self._enable_zmq else 'disabled'}; "
             f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'} "
-            f"Depth: {'enabled, scale=' + str(self.g_depth_scale) + ', depth_zmq_port=' + str(self._depth_zmq_port) if self._enable_depth else 'disabled'}; "
+            f"Depth: {'enabled, processing_scale=' + str(self.g_depth_scale) + ', reported_scale=' + str(self.depth_scale_reported_m_per_unit) + ', depth_zmq_port=' + str(self._depth_zmq_port) if self._enable_depth else 'disabled'}; "
         )
 
     def check_pyrealsense2_install(self):
@@ -1544,8 +1673,9 @@ class ImageServer:
                             rgbd_zmq_port=rgbd_zmq_port,
                         )
                         if enable_depth:
-                            cam_cfg["depth_scale_m_per_unit"] = (
-                                self._cameras[cam_topic].g_depth_scale
+                            _advertise_realsense_depth_metadata(
+                                cam_cfg,
+                                self._cameras[cam_topic],
                             )
                 elif cam_type == "uvc":
                     uid = None

@@ -219,6 +219,26 @@ You will see separate OpenCV windows showing each camera stream.
 
 > Ensure `opencv-python` is installed.
 
+For a depth-enabled RealSense head camera, the client also shows the exact
+three-channel `uint8` depth and surface-normal encoder outputs for the active
+camera calibration. These are the inputs used by newly collected,
+calibration-tagged GR00T datasets and checkpoints.
+Depth uses the fixed metric interval 0.25--1.0 m with zero reserved for invalid
+pixels. Surface normals use the active color-camera intrinsics advertised in
+`head_camera.calibration`; there is no hard-coded camera matrix. The live
+processing scale is canonical `0.001` m/unit. The SDK-reported float spelling is
+provenance only and is never used for processing.
+
+These windows show the 640x480 encoded images, not the final tensor. The
+checkpoint processor subsequently applies its deterministic 0.95 center crop,
+256 resize, and channel normalization `x -> 2*x/255 - 1`. The window titles and
+startup log state this boundary explicitly.
+
+Legacy checkpoints without a camera-calibration tag retain their historical
+intrinsics. A host-only live preview cannot infer that old checkpoint contract,
+so it intentionally shows the active camera's encoding instead; it must not be
+used to claim byte parity with an untagged legacy surface-normal checkpoint.
+
 
 ### 2.2 Experimental capture-synchronised RGBD (RealSense, opt-in)
 

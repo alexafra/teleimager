@@ -47,6 +47,8 @@ def as_color_only_config(cam_config):
         "rgbd_zmq_port",
         "rgbd_protocol",
         "depth_scale_m_per_unit",
+        "depth_scale_reported_m_per_unit",
+        "calibration",
     ):
         head_cfg.pop(unsupported_key, None)
     return cam_config

@@ -12,6 +12,8 @@ def test_fallback_does_not_advertise_unserved_depth_streams():
             "rgbd_zmq_port": 5560,
             "rgbd_protocol": "teleimager-rgbd-v1",
             "depth_scale_m_per_unit": 0.001,
+            "depth_scale_reported_m_per_unit": 0.0010000000474974513,
+            "calibration": {"schema": "realsense_rgbd_calibration.v1"},
         }
     }
 
@@ -25,5 +27,7 @@ def test_fallback_does_not_advertise_unserved_depth_streams():
         "rgbd_zmq_port",
         "rgbd_protocol",
         "depth_scale_m_per_unit",
+        "depth_scale_reported_m_per_unit",
+        "calibration",
     ):
         assert key not in advertised["head_camera"]

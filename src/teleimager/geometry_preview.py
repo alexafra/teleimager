@@ -1,20 +1,123 @@
 """GR00T-compatible previews derived from aligned RealSense depth."""
 
+import hashlib
+import json
+
 import numpy as np
 
 
 DEPTH_NEAR_M = 0.25
 DEPTH_FAR_M = 1.0
 NORMAL_MAX_DEPTH_DELTA_M = 0.05
+CANONICAL_DEPTH_SCALE_M_PER_UNIT = 0.001
+REALSENSE_CALIBRATION_SCHEMA = "realsense_rgbd_calibration.v1"
 
-# D435I 242322076480 colour intrinsics at 640x480. Aligned depth uses these
-# colour-camera intrinsics. Keep synchronized with unitree_lerobot's encoders.
-WIDTH = 640
-HEIGHT = 480
-FX = 605.421508789062
-FY = 605.590515136719
-CX = 321.856811523438
-CY = 242.249740600586
+
+def _canonical_depth_scale(scale_m_per_unit):
+    try:
+        scale = float(scale_m_per_unit)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "scale_m_per_unit must be a finite number"
+        ) from error
+    if not np.isfinite(scale):
+        raise ValueError("scale_m_per_unit must be a finite number")
+    if np.float32(scale) != np.float32(CANONICAL_DEPTH_SCALE_M_PER_UNIT):
+        raise ValueError(
+            "scale_m_per_unit must equal the canonical "
+            f"{CANONICAL_DEPTH_SCALE_M_PER_UNIT} m/unit at float32 precision; "
+            f"got {scale!r}"
+        )
+    return CANONICAL_DEPTH_SCALE_M_PER_UNIT
+
+
+def _validated_color_intrinsics(color):
+    if not isinstance(color, dict):
+        raise ValueError("Camera calibration is missing color intrinsics")
+
+    required = ("width", "height", "fx", "fy", "cx", "cy")
+    missing = [key for key in required if key not in color]
+    if missing:
+        raise ValueError(
+            "Camera color intrinsics are missing " + ", ".join(missing)
+        )
+    if (
+        isinstance(color["width"], bool)
+        or not isinstance(color["width"], (int, np.integer))
+        or isinstance(color["height"], bool)
+        or not isinstance(color["height"], (int, np.integer))
+    ):
+        raise ValueError("Camera color width and height must be integers")
+
+    width = int(color["width"])
+    height = int(color["height"])
+    try:
+        fx, fy, cx, cy = (
+            float(color[key]) for key in ("fx", "fy", "cx", "cy")
+        )
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("Camera color intrinsics must be finite numbers") from error
+    if not np.isfinite((fx, fy, cx, cy)).all():
+        raise ValueError("Camera color intrinsics must be finite numbers")
+    if width < 3 or height < 3 or fx <= 0.0 or fy <= 0.0:
+        raise ValueError("Camera color intrinsics have invalid dimensions or focal lengths")
+    if not 0.0 <= cx < width or not 0.0 <= cy < height:
+        raise ValueError("Camera color principal point lies outside the image")
+    return {
+        "width": width,
+        "height": height,
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+    }
+
+
+def color_intrinsics_from_calibration(calibration):
+    """Verify live calibration provenance and return its color pinhole model."""
+
+    expected_keys = {
+        "schema",
+        "camera",
+        "color",
+        "depth",
+        "depth_to_color",
+        "fingerprint",
+    }
+    if not isinstance(calibration, dict) or set(calibration) != expected_keys:
+        raise ValueError(
+            "Camera config is missing complete depth calibration metadata"
+        )
+    if calibration["schema"] != REALSENSE_CALIBRATION_SCHEMA:
+        raise ValueError(
+            "Camera calibration schema must be "
+            f"{REALSENSE_CALIBRATION_SCHEMA!r}"
+        )
+    fingerprint_payload = {
+        key: value
+        for key, value in calibration.items()
+        if key != "fingerprint"
+    }
+    try:
+        canonical_json = json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Camera calibration contains non-canonical JSON values"
+        ) from error
+    expected_fingerprint = (
+        f"sha256:{hashlib.sha256(canonical_json).hexdigest()}"
+    )
+    if calibration["fingerprint"] != expected_fingerprint:
+        raise ValueError(
+            "Camera calibration fingerprint does not match its payload"
+        )
+    return _validated_color_intrinsics(calibration["color"])
 
 
 def encode_depth_gray_rgb(depth_u16, *, scale_m_per_unit):
@@ -25,9 +128,7 @@ def encode_depth_gray_rgb(depth_u16, *, scale_m_per_unit):
         raise ValueError(
             f"Expected an HxW uint16 depth image; got shape={depth.shape}, dtype={depth.dtype}"
         )
-    scale = float(scale_m_per_unit)
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError(f"scale_m_per_unit must be positive and finite, got {scale}")
+    scale = _canonical_depth_scale(scale_m_per_unit)
 
     depth_m = depth.astype(np.float32) * scale
     valid = depth != 0
@@ -37,22 +138,34 @@ def encode_depth_gray_rgb(depth_u16, *, scale_m_per_unit):
     return np.repeat(gray[..., None], 3, axis=-1)
 
 
-def encode_surface_normals_rgb(depth_u16, *, scale_m_per_unit):
+def encode_surface_normals_rgb(
+    depth_u16,
+    *,
+    scale_m_per_unit,
+    color_intrinsics,
+):
     """Match the camera-XYZ surface-normal image supplied to GR00T."""
 
     depth = np.asarray(depth_u16)
-    if depth.dtype != np.uint16 or depth.shape != (HEIGHT, WIDTH):
+    camera = _validated_color_intrinsics(color_intrinsics)
+    expected_shape = (camera["height"], camera["width"])
+    if depth.dtype != np.uint16 or depth.shape != expected_shape:
         raise ValueError(
-            f"Expected a {HEIGHT}x{WIDTH} uint16 aligned-depth image; "
+            f"Expected a {camera['height']}x{camera['width']} uint16 "
+            "aligned-depth image; "
             f"got shape={depth.shape}, dtype={depth.dtype}"
         )
-    scale = float(scale_m_per_unit)
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError(f"scale_m_per_unit must be positive and finite, got {scale}")
+    scale = _canonical_depth_scale(scale_m_per_unit)
 
     depth_m = depth.astype(np.float32) * np.float32(scale)
-    x_scale = (np.arange(WIDTH, dtype=np.float32) - np.float32(CX)) / np.float32(FX)
-    y_scale = (np.arange(HEIGHT, dtype=np.float32) - np.float32(CY)) / np.float32(FY)
+    x_scale = (
+        np.arange(camera["width"], dtype=np.float32)
+        - np.float32(camera["cx"])
+    ) / np.float32(camera["fx"])
+    y_scale = (
+        np.arange(camera["height"], dtype=np.float32)
+        - np.float32(camera["cy"])
+    ) / np.float32(camera["fy"])
     point_x = depth_m * x_scale[None, :]
     point_y = depth_m * y_scale[:, None]
 
@@ -105,6 +218,9 @@ def encode_surface_normals_rgb(depth_u16, *, scale_m_per_unit):
     encoded_inner = 1 + np.rint(
         np.float32(127.0) * (np.clip(normals, -1.0, 1.0) + 1.0)
     ).astype(np.uint8)
-    encoded = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    encoded = np.zeros(
+        (camera["height"], camera["width"], 3),
+        dtype=np.uint8,
+    )
     encoded[1:-1, 1:-1][valid] = encoded_inner[valid]
     return np.ascontiguousarray(encoded)

@@ -30,7 +30,11 @@ import yaml
 import os
 from collections import deque
 import logging_mp
-from teleimager.geometry_preview import encode_depth_gray_rgb, encode_surface_normals_rgb
+from teleimager.geometry_preview import (
+    color_intrinsics_from_calibration,
+    encode_depth_gray_rgb,
+    encode_surface_normals_rgb,
+)
 
 from .rgbd_protocol import (
     RGBD_PROTOCOL,
@@ -1007,6 +1011,25 @@ def main():
     depth_scale = head_config.get('depth_scale_m_per_unit')
     if show_geometry and depth_scale is None:
         raise RuntimeError("Camera config is missing depth_scale_m_per_unit")
+    color_intrinsics = None
+    if show_geometry:
+        try:
+            color_intrinsics = color_intrinsics_from_calibration(
+                head_config.get("calibration")
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "Cannot render model-visible geometry previews without the "
+                "updated live camera calibration"
+            ) from error
+        logger_mp.info(
+            "Geometry windows show the exact active-camera "
+            f"{color_intrinsics['width']}x{color_intrinsics['height']} uint8 "
+            "depth/normal encoder outputs used by calibration-tagged models. "
+            "The checkpoint processor still applies "
+            "its deterministic 0.95 center crop, 256 resize, and "
+            "x -> 2*x/255 - 1 normalization."
+        )
 
     running = True
     while running:
@@ -1027,10 +1050,14 @@ def main():
                         normals_rgb = encode_surface_normals_rgb(
                             aligned_depth,
                             scale_m_per_unit=depth_scale,
+                            color_intrinsics=color_intrinsics,
                         )
-                        cv2.imshow("Head Depth Gray (GR00T)", depth_gray_rgb)
                         cv2.imshow(
-                            "Head Surface Normals (GR00T)",
+                            "Head Depth Gray uint8 (pre 0.95 crop/256/normalize)",
+                            depth_gray_rgb,
+                        )
+                        cv2.imshow(
+                            "Head Surface Normals uint8 (pre 0.95 crop/256/normalize)",
                             cv2.cvtColor(normals_rgb, cv2.COLOR_RGB2BGR),
                         )
 

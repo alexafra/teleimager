@@ -1,3 +1,5 @@
+import hashlib
+import json
 import sys
 import threading
 import types
@@ -61,9 +63,14 @@ if not hasattr(logging_mp, "get_logger"):
 from teleimager.image_client import TripleRingBuffer  # noqa: E402
 from teleimager import image_server as image_server_module  # noqa: E402
 from teleimager.image_server import (  # noqa: E402
+    CANONICAL_DEPTH_SCALE_M_PER_UNIT,
     ImageServer,
+    REALSENSE_CALIBRATION_SCHEMA,
     RealSenseCamera,
+    _advertise_realsense_depth_metadata,
     _configured_transport_ports,
+    _realsense_calibration,
+    _validated_realsense_depth_scale,
     _validated_rgbd_zmq_port,
 )
 from teleimager.rgbd_protocol import RGBD_PROTOCOL, unpack_rgbd_packet  # noqa: E402
@@ -132,6 +139,168 @@ def _fake_camera(color, aligned_depth, *, legacy_buffers=False):
     camera._ready = threading.Event()
     camera._cam_topic = "head_camera"
     return camera
+
+
+class _VideoProfile:
+    def __init__(self, intrinsics, format_name, fps, extrinsics=None):
+        self._intrinsics = intrinsics
+        self._format_name = format_name
+        self._fps = fps
+        self._extrinsics = extrinsics
+
+    def get_intrinsics(self):
+        return self._intrinsics
+
+    def format(self):
+        return self._format_name
+
+    def fps(self):
+        return self._fps
+
+    def get_extrinsics_to(self, _other):
+        return self._extrinsics
+
+
+class _Device:
+    def __init__(self, info):
+        self._info = info
+
+    def supports(self, key):
+        return key in self._info
+
+    def get_info(self, key):
+        return self._info[key]
+
+
+def test_sdk_scale_is_float32_validated_but_processing_scale_is_exact():
+    processing, reported = _validated_realsense_depth_scale(
+        0.0010000000474974513
+    )
+
+    assert processing == CANONICAL_DEPTH_SCALE_M_PER_UNIT == 0.001
+    assert reported == 0.0010000000474974513
+
+
+@pytest.mark.parametrize("reported", [0.0005, 0.0011, float("nan"), float("inf")])
+def test_incompatible_sdk_depth_scale_is_rejected(reported):
+    with pytest.raises(ValueError, match="depth scale"):
+        _validated_realsense_depth_scale(reported)
+
+
+def test_active_realsense_calibration_has_canonical_schema_and_fingerprint():
+    rs = types.SimpleNamespace(
+        camera_info=types.SimpleNamespace(
+            name="name",
+            serial_number="serial",
+            product_id="product_id",
+            firmware_version="firmware",
+        )
+    )
+    device = _Device(
+        {
+            "name": "Intel RealSense D435I",
+            "serial": "254322071415",
+            "product_id": "0B3A",
+            "firmware": "5.15.1.55",
+        }
+    )
+    color_intrinsics = types.SimpleNamespace(
+        width=640,
+        height=480,
+        fx=609.3858642578125,
+        fy=609.4705200195312,
+        ppx=325.95001220703125,
+        ppy=247.26507568359375,
+        model="distortion.inverse_brown_conrady",
+        coeffs=[0.0] * 5,
+    )
+    depth_intrinsics = types.SimpleNamespace(
+        width=640,
+        height=480,
+        fx=397.5912170410156,
+        fy=397.5912170410156,
+        ppx=315.6465148925781,
+        ppy=244.2028350830078,
+        model="distortion.brown_conrady",
+        coeffs=[0.0] * 5,
+    )
+    extrinsics = types.SimpleNamespace(
+        rotation=[
+            0.9999486207962036,
+            0.0033009203616529703,
+            0.009585974738001823,
+            -0.0033925294410437346,
+            0.9999485611915588,
+            0.009556086733937263,
+            -0.009553938172757626,
+            -0.009588115848600864,
+            0.9999083876609802,
+        ],
+        translation=[
+            0.014800711534917355,
+            0.0008831368759274483,
+            0.0007359444862231612,
+        ],
+    )
+    color_profile = _VideoProfile(color_intrinsics, "format.bgr8", 30)
+    depth_profile = _VideoProfile(
+        depth_intrinsics,
+        "format.z16",
+        30,
+        extrinsics=extrinsics,
+    )
+
+    calibration = _realsense_calibration(
+        rs,
+        device,
+        color_profile,
+        depth_profile,
+    )
+
+    assert calibration["schema"] == REALSENSE_CALIBRATION_SCHEMA
+    assert calibration["camera"] == {
+        "model": "Intel RealSense D435I",
+        "serial": "254322071415",
+        "product_id": "0B3A",
+        "firmware": "5.15.1.55",
+    }
+    assert calibration["color"]["format"] == "bgr8"
+    assert calibration["color"]["cx"] == 325.95001220703125
+    assert calibration["depth"]["format"] == "z16"
+    assert calibration["depth_to_color"]["rotation"] == extrinsics.rotation
+    assert calibration["fingerprint"] == (
+        "sha256:f7860e3e2be34af131e214c74d417217c889eff3a069dbec543be3fba15b027b"
+    )
+    fingerprint = calibration.pop("fingerprint")
+    canonical_json = json.dumps(
+        calibration,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    assert fingerprint == f"sha256:{hashlib.sha256(canonical_json).hexdigest()}"
+
+
+def test_advertised_depth_metadata_uses_canonical_scale_and_is_copied():
+    camera = types.SimpleNamespace(
+        depth_scale_reported_m_per_unit=0.0010000000474974513,
+        calibration={
+            "schema": REALSENSE_CALIBRATION_SCHEMA,
+            "fingerprint": "sha256:abc",
+        },
+    )
+    config = {}
+
+    _advertise_realsense_depth_metadata(config, camera)
+    camera.calibration["schema"] = "mutated"
+
+    assert config["depth_scale_m_per_unit"] == 0.001
+    assert (
+        config["depth_scale_reported_m_per_unit"]
+        == 0.0010000000474974513
+    )
+    assert config["calibration"]["schema"] == REALSENSE_CALIBRATION_SCHEMA
 
 
 def test_update_frame_emits_one_same_frameset_packet_and_reuses_encodes():
