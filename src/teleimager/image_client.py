@@ -31,7 +31,7 @@ import os
 from collections import deque
 import logging_mp
 from teleimager.geometry_preview import (
-    color_intrinsics_from_calibration,
+    color_intrinsics_for_preview,
     encode_depth_gray_rgb,
     encode_surface_normals_rgb,
 )
@@ -1014,18 +1014,28 @@ def main():
     color_intrinsics = None
     if show_geometry:
         try:
-            color_intrinsics = color_intrinsics_from_calibration(
-                head_config.get("calibration")
+            color_intrinsics, calibration_source = color_intrinsics_for_preview(
+                head_config
             )
         except ValueError as error:
             raise RuntimeError(
                 "Cannot render model-visible geometry previews without the "
                 "updated live camera calibration"
             ) from error
+        if calibration_source == "pinned":
+            logger_mp.warning(
+                "Camera server omitted calibration metadata; using the exact "
+                "pinned 640x480@30 color intrinsics for D435I serial "
+                "254322071415 for this standalone preview. This does not alter "
+                "the image-server or live-policy contracts."
+            )
         logger_mp.info(
-            "Geometry windows show the exact active-camera "
+            "Geometry windows show the canonical surface-normal v2/depth "
+            "active-camera "
             f"{color_intrinsics['width']}x{color_intrinsics['height']} uint8 "
-            "depth/normal encoder outputs used by calibration-tagged models. "
+            "encoder outputs. Surface-normal v2 masks the same inclusive "
+            "0.25-1.0 m range as depth; legacy v1 checkpoints intentionally "
+            "retain their unmasked live encoding. "
             "The checkpoint processor still applies "
             "its deterministic 0.95 center crop, 256 resize, and "
             "x -> 2*x/255 - 1 normalization."
@@ -1057,7 +1067,7 @@ def main():
                             depth_gray_rgb,
                         )
                         cv2.imshow(
-                            "Head Surface Normals uint8 (pre 0.95 crop/256/normalize)",
+                            "Head Surface Normals v2 masked uint8 (pre crop/resize/normalize)",
                             cv2.cvtColor(normals_rgb, cv2.COLOR_RGB2BGR),
                         )
 
