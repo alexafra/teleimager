@@ -1,3 +1,15 @@
+# Research fork: teleimager
+
+This is [alexafra's research fork](https://github.com/alexafra/teleimager) of [unitreerobotics/teleimager](https://github.com/unitreerobotics/teleimager). **The thesis implementation is on [`research/rgbd-data-collection`](https://github.com/alexafra/teleimager/tree/research/rgbd-data-collection), not this `main` branch.**
+
+Raw and aligned depth transport, camera calibration metadata, geometry previews, and optional same-frameset RGB-D messaging.
+
+Read the [research-branch README](https://github.com/alexafra/teleimager/blob/research/rgbd-data-collection/README.md) for the implemented additions, companion repositories, branch-specific setup, and limitations. Selecting this fork's `main` branch does not select the research configuration.
+
+The upstream documentation and attribution below are retained for reference; they are not validation or safety guarantees for the research additions. Existing licensing and third-party attribution remain applicable.
+
+---
+
 <div align="center">
   <img src="teleimager_logo.png" alt="Teleimager Logo" width="100%">
   <a href="https://www.unitree.com/" target="_blank">
