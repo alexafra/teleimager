@@ -1,3 +1,29 @@
+# Calibrated RGB-D transport research fork
+
+This fork extends [Unitree Robotics' TeleImager](https://github.com/unitreerobotics/teleimager) for RGB-D demonstration collection and depth-conditioned policy experiments. The research implementation is on **`research/rgbd-data-collection`**, not `main`.
+
+## What this fork adds
+
+- Raw and RGB-aligned RealSense depth streams, active-camera calibration metadata and fingerprints, and a canonical processing depth scale.
+- Fixed-metric depth and surface-normal previews with validity masks, for inspecting geometry before model preprocessing.
+- An optional versioned RGB-D message carrying a colour JPEG, aligned depth PNG, sequence metadata, and timestamps from one RealSense SDK frameset. Client subscription is lazy; independent streams remain the default.
+
+Implementation entrypoints: [image server](src/teleimager/image_server.py), [image client](src/teleimager/image_client.py), [RGB-D protocol](src/teleimager/rgbd_protocol.py), and [geometry encoders](src/teleimager/geometry_preview.py).
+
+```bash
+git clone --branch research/rgbd-data-collection https://github.com/alexafra/teleimager.git
+```
+
+This branch is also used as a submodule by the [XR collection fork](https://github.com/alexafra/xr_teleoperate/tree/research/g1-data-collection). Recorded data is converted with [unitree_lerobot](https://github.com/alexafra/unitree_lerobot/tree/research/g1-rgbd-dataset-tools) for the [Isaac-GR00T research fork](https://github.com/alexafra/Isaac-GR00T/tree/research/g1-dex3-finetuning).
+
+Same-frameset pairing does not establish identical RGB/depth exposure times. Do not subtract monotonic timestamps from different hosts. Previews are encoder outputs, not final model tensors, and do not establish compatibility with untagged legacy checkpoints.
+
+## Upstream documentation and attribution
+
+The original Unitree documentation and acknowledgements are retained below. Its installation examples must be matched to this branch's camera configuration; upstream clone commands do not select this fork. See the existing [LICENSE](LICENSE).
+
+---
+
 <div align="center">   <h1 align="center">Tele Imager</h1>   <a href="https://www.unitree.com/" target="_blank">     <img src="https://www.unitree.com/images/0079f8938336436e955ea3a98c4e1e59.svg" alt="Unitree LOGO" width="15%">   </a>   <p align="center">     <a> English </a> | <a href="README_zh-CN.md">中文</a>   </p> </div>
 <p align="center">
   <a href="https://github.com/unitreerobotics/xr_teleoperate/wiki" target="_blank"> <img src="https://img.shields.io/badge/GitHub-Wiki-181717?logo=github" alt="Unitree LOGO"></a> <a href="https://discord.gg/ZwcVwxv5rq" target="_blank"><img src="https://img.shields.io/badge/-Discord-5865F2?style=flat&logo=Discord&logoColor=white" alt="Unitree LOGO"> <a href="https://deepwiki.com/unitreerobotics/teleimager"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a> </a>
